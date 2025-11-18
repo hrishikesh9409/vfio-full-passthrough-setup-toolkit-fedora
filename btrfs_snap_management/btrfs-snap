@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+VERSION="7.2"
+LOG_DIR="/var/log/btrfs-snap"
+TOP_MNT="/.snapmgr-top"              # subvolid=5 mountpoint (on-demand)
+SNAP_DIR="$TOP_MNT/snapshots"        # snapshots live on top-level
+PINS_FILE="$SNAP_DIR/.pinned"
+DATE_FMT="%Y%m%d-%H%M%S"
+BLS_DIR="/boot/loader/entries"
+RSYNC_EXCLUDES=('/proc/*' '/sys/*' '/dev/*' '/run/*' '/tmp/*' "$TOP_MNT/*" '/media/*' '/var/tmp/*' '/mnt/*')
+
+log(){ mkdir -p "$LOG_DIR"; printf "[btrfs-snap] %s %s\n" "$(date '+%F %T')" "$*" | tee -a "$LOG_DIR/run.log"; }
+err(){ printf "[btrfs-snap][ERROR] %s\n" "$*" | tee -a "$LOG_DIR/run.log" >&2; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Run as root"; exit 1; }; }
+backup_file(){ local src="$1"; [[ -e "$src" ]] || return 0; local ts; ts=$(date +"$DATE_FMT"); local dst="$LOG_DIR/backup.$(basename "$src").$ts"; cp -a "$src" "$dst"; log "Backup: $src -> $dst"; }
+
+get_root_dev(){ local src; src=$(findmnt -no SOURCE /); printf "%s\n" "${src%%[*}"; }
+get_root_uuid(){ blkid -s UUID -o value "$(get_root_dev)" || true; }
+have_grubby(){ command -v grubby >/dev/null 2>&1; }
+is_live_overlay(){ findmnt -no FSTYPE / | grep -q '^overlay$'; }
+
+mount_top(){
+  mkdir -p "$TOP_MNT"
+  local dev; dev=$(get_root_dev)
+  [[ -b "$dev" ]] || { err "Root device not a block dev: $dev"; exit 1; }
+  mountpoint -q "$TOP_MNT" || mount -t btrfs -o subvolid=5 "$dev" "$TOP_MNT"
+}
+umount_top(){ mountpoint -q "$TOP_MNT" && umount "$TOP_MNT" || true; }
+
+current_subvol_path(){
+  local p
+  p=$(findmnt -no OPTIONS / | sed -n 's/.*\bsubvol=\([^ ,]*\).*/\1/p')
+  if [[ -n "${p:-}" && "$p" != "/" ]]; then echo "${p#/}"; return 0; fi
+  p=$(btrfs subvolume show / 2>/dev/null | sed -n 's/^\s*Path:\s*//p' | head -n1 || true)
+  [[ -z "$p" ]] && echo "/" || echo "${p#/}"
+  return 0
+}
+
+ensure_snapshot_area(){
+  mount_top
+  mkdir -p "$SNAP_DIR"
+  touch "$PINS_FILE" || true
+  umount_top
+}
+
+update_bls_rootflags(){
+  local newp="$1"
+  [[ -d "$BLS_DIR" ]] || { err "BLS dir not found: $BLS_DIR"; return 1; }
+  local bdir="$LOG_DIR/bls.$(date +"$DATE_FMT")"; mkdir -p "$bdir"
+  cp -a "$BLS_DIR/"*.conf "$bdir/" 2>/dev/null || true
+  local f
+  shopt -s nullglob
+  for f in "$BLS_DIR"/*.conf; do
+    if grep -q '^\s*options\s' "$f"; then
+      if grep -q 'rootflags=subvol=' "$f"; then
+        sed -i "s#rootflags=subvol=[^ ]*#rootflags=subvol=$newp#g" "$f"
+      else
+        sed -i "s#^\s*options\s\+#&rootflags=subvol=$newp #g" "$f"
+      fi
+    fi
+  done
+  log "Updated BLS rootflags -> $newp"
+}
+
+update_kernel_rootflags(){
+  local newp="$1"
+  local rf; rf=$(sed -n 's/.*\(rootflags=subvol=[^ ]*\).*/\1/p' /proc/cmdline || true)
+  if have_grubby; then
+    [[ -n "${rf:-}" ]] && grubby --update-kernel=ALL --remove-args="$rf" || true
+    grubby --update-kernel=ALL --args="rootflags=subvol=$newp"
+    log "Updated kernel args via grubby -> rootflags=subvol=$newp"
+  else
+    update_bls_rootflags "$newp"
+  fi
+}
+
+update_fstab_root(){
+  local newp="$1" fstab="/etc/fstab" tmp
+  backup_file "$fstab"
+  tmp="$(mktemp)"
+  awk -v newsv="$newp" '
+    $0 ~ /^[[:space:]]*#/ {print; next}
+    NF>=2 && $2=="/" {
+      split($0,a,/[\t ]+/); opts=a[4]
+      if (opts ~ /subvol=/) gsub(/subvol=[^, ]+/,"subvol="newsv,opts);
+      else if (opts=="-" || opts=="defaults") opts="subvol="newsv;
+      else opts=opts",subvol="newsv;
+      a[4]=opts;
+      printf "%s %s %s %s", a[1],a[2],a[3],a[4];
+      for(i=5;i<=NF;i++) printf " %s", a[i];
+      printf "\n"; next
+    }
+    {print}
+  ' "$fstab" > "$tmp"
+  mv "$tmp" "$fstab"
+  log "Updated /etc/fstab -> subvol=$newp"
+}
+
+is_pinned(){ mount_top; grep -Fxq "$1" "$PINS_FILE" 2>/dev/null; local r=$?; umount_top; return $r; }
+pin_snapshot(){ ensure_snapshot_area; mount_top; grep -Fxq "$1" "$PINS_FILE" 2>/dev/null || echo "$1" >> "$PINS_FILE"; umount_top; log "Pinned: $1"; }
+unpin_snapshot(){ ensure_snapshot_area; mount_top; [[ -f "$PINS_FILE" ]] && grep -Fxv "$1" "$PINS_FILE" > "$PINS_FILE.tmp" || :; [[ -f "$PINS_FILE.tmp" ]] && mv "$PINS_FILE.tmp" "$PINS_FILE"; umount_top; log "Unpinned: $1"; }
+
+list_snapshots(){
+  ensure_snapshot_area
+  mount_top
+  echo "#    Created              Pinned     Name"
+  echo "---- -------------------- ---------- ----------------------------------------"
+  local n i=1 human pin d
+  shopt -s nullglob
+  for d in "$SNAP_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    n=$(basename "$d")
+    if [[ "$n" =~ ^([0-9]{8})-([0-9]{6})- ]]; then
+      human="${BASH_REMATCH[1]:0:4}-${BASH_REMATCH[1]:4:2}-${BASH_REMATCH[1]:6:2} ${BASH_REMATCH[2]:0:2}:${BASH_REMATCH[2]:2:2}:${BASH_REMATCH[2]:4:2}"
+    else
+      human="--"
+    fi
+    if grep -Fxq "$n" "$PINS_FILE" 2>/dev/null; then pin="YES"; else pin="no"; fi
+    printf "%-4s %-20s %-10s %-s\n" "$i" "$human" "$pin" "$n"
+    ((i++)) || true
+  done
+  umount_top
+}
+
+create_snapshot(){
+  need_root
+  ensure_snapshot_area
+  local label="${1:-manual}"
+  local ts; ts=$(date +"$DATE_FMT")
+  local name="${ts}-${label}"
+
+  local cur; cur=$(current_subvol_path)
+  if [[ -z "$cur" || "$cur" == "/" ]]; then
+    err "Your root is top-level (/). Run: btrfs-snap migrate"
+    exit 1
+  fi
+
+  mount_top
+  local src="$TOP_MNT/${cur#/}"
+  local dst="$SNAP_DIR/$name"
+  if ! btrfs subvolume show "$src" >/dev/null 2>&1; then
+    umount_top; err "Source is not a subvolume: $src"; exit 1
+  fi
+  log "Creating snapshot: $name  (src: $src -> dst: $dst)"
+  btrfs subvolume snapshot "$src" "$dst"
+  umount_top
+  log "Created snapshot: $name"
+}
+
+restore_snapshot(){
+  need_root
+  local name="${1:-}"; [[ -n "$name" ]] || { err "Usage: btrfs-snap restore <NAME>"; exit 1; }
+  ensure_snapshot_area
+  mount_top
+  [[ -d "$SNAP_DIR/$name" ]] || { umount_top; err "Snapshot not found: $name"; exit 1; }
+  [[ -e "$TOP_MNT/@.new" ]] && { umount_top; err "@.new exists; finalize/remove it first"; exit 1; }
+  log "Cloning '$name' -> '@.new'"
+  btrfs subvolume snapshot "$SNAP_DIR/$name" "$TOP_MNT/@.new"
+  umount_top
+  update_fstab_root "@.new"
+  update_kernel_rootflags "@.new"
+  log "Restore staged. Reboot into @.new, then run: btrfs-snap finalize"
+}
+
+finalize_restore(){
+  need_root
+  local cur; cur=$(current_subvol_path)
+  if [[ "$cur" != "@.new" && "$cur" != "/@.new" ]]; then
+    err "Finalize expects current root to be @.new (got: $cur)"; exit 1
+  fi
+  ensure_snapshot_area
+  mount_top
+
+  # Set default to @.new so @ is deletable even if it was default
+  local id_new id_at
+  id_new=$(btrfs subvolume list "$TOP_MNT" | awk '$9=="@.new"{print $2}')
+  [[ -n "${id_new:-}" ]] && btrfs subvolume set-default "$id_new" "$TOP_MNT" || true
+
+  # Delete old @ if present
+  if [[ -d "$TOP_MNT/@" ]]; then
+    log "Deleting canonical '@'"
+    btrfs subvolume delete "$TOP_MNT/@" || true
+  fi
+
+  # Rename @.new -> @
+  log "Renaming '@.new' -> '@'"
+  mv "$TOP_MNT/@.new" "$TOP_MNT/@"
+
+  umount_top
+
+  # Switch boot + fstab back to @
+  update_fstab_root "@"
+  update_kernel_rootflags "@"
+
+  # Make @ the default again (best effort)
+  mount_top
+  id_at=$(btrfs subvolume list "$TOP_MNT" | awk '$9=="@"{print $2}')
+  [[ -n "${id_at:-}" ]] && btrfs subvolume set-default "$id_at" "$TOP_MNT" || true
+  umount_top
+  log "Finalize complete. You can reboot back into canonical '@'."
+}
+
+delete_snapshot(){
+  need_root
+  local name="${1:-}"; [[ -n "$name" ]] || { err "Usage: btrfs-snap delete <NAME>"; exit 1; }
+  ensure_snapshot_area
+  is_pinned "$name" && { err "Snapshot is pinned: $name"; exit 1; }
+  mount_top
+  local path="$SNAP_DIR/$name"
+  [[ -d "$path" ]] || { umount_top; err "Snapshot not found: $name"; exit 1; }
+  btrfs subvolume delete "$path"
+  umount_top
+  log "Deleted snapshot: $name"
+}
+
+migrate_to_at(){
+  need_root
+  is_live_overlay && { err "Live/overlay root detected. Run on the installed system."; exit 1; }
+  local cur; cur=$(current_subvol_path)
+  if [[ "$cur" == "@" || "$cur" == "/@" ]]; then
+    log "Already on '@'. Migration not needed."
+    ensure_snapshot_area
+    return 0
+  fi
+  log "Migrating from top-level (/) to '@' subvolume"
+  mount_top
+  [[ -d "$TOP_MNT/@" ]] || btrfs subvolume create "$TOP_MNT/@"
+  local args=(-aAXH --one-file-system)
+  for e in "${RSYNC_EXCLUDES[@]}"; do args+=(--exclude "$e"); done
+  log "Rsyncing / -> $TOP_MNT/@ (this may take a while)"
+  rsync "${args[@]}" / "$TOP_MNT/@"/
+  umount_top
+  update_fstab_root "@"
+  update_kernel_rootflags "@"
+  mount_top
+  local id; id=$(btrfs subvolume list "$TOP_MNT" | awk '$9=="@"{print $2}')
+  [[ -n "${id:-}" ]] && btrfs subvolume set-default "$id" "$TOP_MNT" || true
+  umount_top
+  ensure_snapshot_area
+  log "Migration complete. Reboot now to start using '@'."
+}
+
+doctor(){
+  echo "btrfs-snap v$VERSION"
+  echo "Root device: $(get_root_dev)"
+  echo "Root UUID:   $(get_root_uuid)"
+  echo "Root subvol: $(current_subvol_path)"
+  if have_grubby; then echo "Boot args:    grubby"; else echo "Boot args:    BLS"; fi
+  if [[ -d "$BLS_DIR" ]] then echo "BLS dir:      present"; else echo "BLS dir:      missing"; fi
+  echo "Top mount:    $TOP_MNT"
+  echo "Snap dir:     $SNAP_DIR"
+}
+
+usage(){
+  cat <<EOF
+btrfs-snap v$VERSION — one-shot Btrfs snapshot manager
+
+USAGE:
+  btrfs-snap bootstrap         # one-time: ensure snapshot area; migrate to @ if needed
+  btrfs-snap create [label]    # create snapshot of current root subvol -> <YYYYMMDD-HHMMSS>-label
+  btrfs-snap list              # list snapshots (with pin status)
+  btrfs-snap pin <NAME>        # pin snapshot (protect from delete)
+  btrfs-snap unpin <NAME>      # unpin snapshot
+  btrfs-snap delete <NAME>     # delete snapshot (fails if pinned)
+  btrfs-snap restore <NAME>    # stage restore: clone -> @.new, update fstab+boot; then reboot
+  btrfs-snap finalize          # after booting into @.new: promote to @ (handles default), update fstab+boot
+  btrfs-snap migrate           # force migration to @ (only if currently on top-level '/')
+  btrfs-snap doctor            # show state
+EOF
+}
+
+main(){
+  local cmd="${1:-}"; shift || true
+  case "${cmd:-}" in
+    bootstrap) need_root; ensure_snapshot_area; migrate_to_at ;;
+    create)    create_snapshot "${1:-manual}" ;;
+    list)      list_snapshots ;;
+    pin)       pin_snapshot "${1:-}";;
+    unpin)     unpin_snapshot "${1:-}";;
+    delete)    delete_snapshot "${1:-}";;
+    restore)   restore_snapshot "${1:-}";;
+    finalize)  finalize_restore ;;
+    migrate)   migrate_to_at ;;
+    doctor)    doctor ;;
+    ""|-h|--help) usage ;;
+    *) err "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+main "$@"

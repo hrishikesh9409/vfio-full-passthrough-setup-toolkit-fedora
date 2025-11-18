@@ -1,0 +1,8 @@
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_TERMINAL_OUTPUT="console"
+GRUB_CMDLINE_LINUX="resume=UUID=fc6600fa-d85c-4962-bc58-dd98a4ed0b8e rhgb rd.driver.blacklist=nouveau,nova_core modprobe.blacklist=nouveau,nova_core loglevel=3 amd_iommu=on iommu=pt pcie_acs_override=downstream,multifunction kvm.ignore_msrs=1 amd_pstate=active mitigations=off video=efifb:off isolcpus=1-16,managed_nohz nohz_full=1-16 rcu_nocbs=1-16"
+GRUB_DISABLE_RECOVERY="true"
+GRUB_ENABLE_BLSCFG=true

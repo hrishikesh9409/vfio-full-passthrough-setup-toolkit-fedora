@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+log(){ printf "[i] %s\n" "$*"; }
+warn(){ printf "[!] %s\n" "$*" >&2; }
+err(){ printf "[x] %s\n" "$*" >&2; exit 1; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || err "Run as root"; }
+
+TOP_MNT='/.snapmgr-top'
+BLS_DIR='/boot/loader/entries'
+
+fs_uuid_root() {
+  # FS-UUID of the filesystem that contains /
+  findmnt -no UUID /
+}
+
+mount_top() {
+  mkdir -p "$TOP_MNT"
+  if mountpoint -q "$TOP_MNT"; then return 0; fi
+  local uuid; uuid="$(fs_uuid_root || true)"
+  [[ -n "${uuid:-}" ]] || err "Could not resolve FS-UUID for /"
+  log "Mounting Btrfs top-level (ID 5) by UUID=$uuid at $TOP_MNT"
+  # Mount by UUID so we never hit the wrong /dev/nvme… device
+  mount -o subvolid=5 "UUID=$uuid" "$TOP_MNT"
+}
+
+subvol_id() {
+  # $1: subvol path
+  btrfs subvolume show "$1" | awk '/Subvolume ID:/ {print $3}'
+}
+
+is_root_on_new() {
+  findmnt -no OPTIONS / | grep -q 'subvol=@.new'
+}
+
+unmount_under() {
+  # $1 prefix
+  local pfx="$1"
+  awk '{print $5}' /proc/self/mountinfo | while read -r m; do
+    case "$m" in
+      "$pfx"*) umount -lf "$m" 2>/dev/null || true ;;
+    esac
+  done
+}
+
+delete_children_deep_first() {
+  # $1 parent subvol path
+  local parent="$1"
+  # List only subvol paths, then delete deepest-first
+  btrfs subvolume list -o "$parent" \
+    | sed -E 's|.* path ||' \
+    | sed "s|^|$TOP_MNT/|" \
+    | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2- \
+    | while read -r sv; do
+        [ -d "$sv" ] || continue
+        btrfs subvolume delete "$sv" || exit 1
+      done
+}
+
+normalize_boot_refs_to_at() {
+  # Replace any @.new → @ in fstab + BLS + grubby
+  if [ -f /etc/fstab ]; then
+    sed -i 's,subvol=@\.new,subvol=@,g; s,rootflags=subvol=@\.new,rootflags=subvol=@,g' /etc/fstab
+  fi
+  if ls "$BLS_DIR"/*.conf >/dev/null 2>&1; then
+    sed -i 's,rootflags=subvol=@\.new,rootflags=subvol=@,g' "$BLS_DIR"/*.conf || true
+  fi
+  grubby --update-kernel=ALL --remove-args="rootflags=subvol=@.new" --args="rootflags=subvol=@" 2>/dev/null || true
+}
+
+doctor() {
+  local dev uuid subvol
+  dev="$(findmnt -no SOURCE / | sed 's/\[.*//')"
+  uuid="$(findmnt -no UUID / 2>/dev/null || true)"
+  subvol="$(findmnt -no OPTIONS / | sed -n 's/.*subvol=\([^ ,]*\).*/\1/p')"
+  echo "btrfs-snap finalize helper"
+  echo "Root device: ${dev:-?}"
+  echo "Root UUID:   ${uuid:-?}"
+  echo "Root subvol: ${subvol:-?}"
+  echo "Top mount:    $TOP_MNT"
+}
+
+main() {
+  need_root
+  mount_top
+
+  local OLD="$TOP_MNT/@"
+  local NESTED_NEW="$OLD/@.new"
+  local TOP_NEW="$TOP_MNT/@.new"
+
+  if is_root_on_new; then
+    log "Currently booted from subvol=@.new (good for finalize)"
+  else
+    warn "Root is NOT on @.new; finalize will still attempt to promote if @.new exists."
+  fi
+
+  # Validate layout and help user if @ or @.new are missing
+  if [ ! -d "$OLD" ] && [ ! -d "$TOP_NEW" ] && [ ! -d "$NESTED_NEW" ]; then
+    warn "Could not find '@' or '@.new' under $TOP_MNT."
+    warn "Subvolumes at top level:"
+    btrfs subvolume list "$TOP_MNT" | sed -E 's|.* path ||'
+    err "Nothing to finalize."
+  fi
+
+  # If @.new is nested under @, hoist it to top-level (fixes @ deletion)
+  if [ -d "$NESTED_NEW" ]; then
+    log "Hoisting @.new from $NESTED_NEW to $TOP_NEW ..."
+    # Fix accidental nested creation like /.snapmgr-top/@.new/@.new
+    if [ -d "$TOP_NEW/@.new" ]; then
+      log "Fix accidental nested @.new/@.new; lifting inner up"
+      mv "$TOP_NEW/@.new" "${TOP_NEW}.tmp"
+      rmdir "$TOP_NEW" 2>/dev/null || true
+      mv "${TOP_NEW}.tmp" "$TOP_NEW"
+    fi
+    # If $TOP_NEW not present yet, create writable snapshot
+    if [ ! -d "$TOP_NEW" ]; then
+      btrfs subvolume snapshot "$NESTED_NEW" "$TOP_NEW"
+    fi
+  elif [ -d "$TOP_NEW" ]; then
+    log "@.new already present at $TOP_NEW"
+  else
+    err "@.new not found at $NESTED_NEW or $TOP_NEW — nothing to finalize."
+  fi
+
+  # Make @.new the default so we can delete @ even if it was default before
+  local NEW_ID; NEW_ID="$(subvol_id "$TOP_NEW")"
+  log "Setting default subvolume to @.new (id $NEW_ID)"
+  btrfs subvolume set-default "$NEW_ID" "$TOP_MNT"
+
+  # Unmount anything under @ and under nested @.new
+  log "Unmounting any mounts under $OLD ..."
+  unmount_under "$OLD"
+  if [ -d "$NESTED_NEW" ]; then
+    log "Unmounting mounts under nested $NESTED_NEW ..."
+    unmount_under "$NESTED_NEW"
+  fi
+
+  # If nested @.new has children, delete them deepest-first; then delete nested @.new
+  if [ -d "$NESTED_NEW" ]; then
+    log "Deleting child subvolumes inside nested $NESTED_NEW ..."
+    delete_children_deep_first "$NESTED_NEW"
+    log "Deleting nested $NESTED_NEW ..."
+    btrfs subvolume delete "$NESTED_NEW" || true
+  fi
+
+  # Delete child subvolumes under @, then delete @
+  if [ -d "$OLD" ]; then
+    log "Deleting child subvolumes inside $OLD ..."
+    delete_children_deep_first "$OLD"
+    log "Deleting $OLD ..."
+    btrfs subvolume delete "$OLD" || err "Could not delete $OLD (still not empty?)"
+  fi
+
+  # Promote @.new → @
+  if [ -d "$TOP_NEW" ]; then
+    log "Promoting $TOP_NEW -> $OLD ..."
+    mv "$TOP_NEW" "$OLD"
+  fi
+
+  # Make the new @ the default
+  local NEW_AT_ID; NEW_AT_ID="$(subvol_id "$OLD")"
+  log "Setting default subvolume to @ (id $NEW_AT_ID)"
+  btrfs subvolume set-default "$NEW_AT_ID" "$TOP_MNT"
+
+  # Normalize boot refs
+  log "Normalizing fstab/BLS/grubby to subvol=@ ..."
+  normalize_boot_refs_to_at
+
+  echo
+  doctor
+  echo
+  log "Finalize complete. Reboot recommended."
+}
+
+main "$@"

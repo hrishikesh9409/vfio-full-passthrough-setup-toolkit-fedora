@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# safe_update.sh — Safely update Fedora while preserving VFIO stability
+# - Updates DNF userspace packages while excluding VFIO-critical components
+# - Updates Flatpak apps/runtimes
+# - Refreshes Snap packages
+# - Optionally creates a pre-update Btrfs snapshot (with your btrfs-snap tool)
+# - Streams output live and logs to /var/log/vfio-maintenance/
+#
+# Usage:
+#   sudo ./safe_update.sh            # full run (DNF + Flatpak + Snap)
+#   sudo ./safe_update.sh log        # list recent logs
+#   sudo ./safe_update.sh follow     # tail the latest log
+#   sudo TAKE_SNAPSHOT=0 ./safe_update.sh     # disable snapshot for this run
+#   sudo DNF_EXCLUDES="kernel* ..." ./safe_update.sh  # override excludes
+#
+# Notes:
+# - We intentionally EXCLUDE: kernel*, NVIDIA, QEMU, libvirt, virt*, OVMF/edk2, etc.
+# - We still apply *security* updates to userspace, but kernel packages remain excluded.
+# - No initramfs rebuilds are triggered here (keeps NVIDIA/VFIO safe).
+
+set -euo pipefail
+IFS=$'\n\t'
+
+LOG_DIR="/var/log/vfio-maintenance"
+TS="$(date +%F_%H-%M-%S)"
+LOG_FILE="$LOG_DIR/safe_update_${TS}.log"
+mkdir -p "$LOG_DIR"
+
+# ---------- Configurable toggles ----------
+TAKE_SNAPSHOT="${TAKE_SNAPSHOT:-1}"            # 1 = take pre-update btrfs snapshot if tool exists
+SNAPSHOT_NAME_PREFIX="${SNAPSHOT_NAME_PREFIX:-pre-safe-update}"
+PIN_SNAPSHOT="${PIN_SNAPSHOT:-1}"              # 1 = pin snapshot if created
+
+# Excludes to keep VFIO/NVIDIA stack stable (space-separated globs)
+DNF_EXCLUDES="${DNF_EXCLUDES:-\
+kernel* kernel-core* kernel-modules* kernel-modules-extra* kernel-devel* kernel-headers* \
+kernel-tools* perf* python3-perf* libperf* rtla* rv* \
+akmod-nvidia* kmod-nvidia* nvidia-* xorg-x11-drv-nvidia* \
+qemu* libvirt* virt-* edk2-ovmf* ovmf* \
+uki-* uki-direct* systemd-boot* shim-* grub2-* \
+}"
+
+
+# DNF CLI flags (you can override via env)
+DNF_FLAGS="${DNF_FLAGS:---refresh -y --best --allowerasing}"
+
+# Optional: run a second security-only pass (same excludes) to be explicit
+DNF_SECURITY_PASS="${DNF_SECURITY_PASS:-1}"
+# -----------------------------------------
+
+need_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    echo "Please run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+log()   { printf "[%s] %s\n" "$(date '+%F %T')" "$*"; }
+hr()    { printf -- "------------------------------------------------------------\n"; }
+
+list_logs() {
+  ls -1t "$LOG_DIR"/safe_update_*.log 2>/dev/null || true
+}
+
+follow_latest() {
+  local latest
+  latest="$(list_logs | head -n1)"
+  if [[ -z "${latest:-}" ]]; then
+    echo "No logs yet."
+    exit 0
+  fi
+  echo "Tailing: $latest"
+  tail -F "$latest"
+}
+
+take_btrfs_snapshot() {
+  if [[ "$TAKE_SNAPSHOT" != "1" ]]; then
+    return 0
+  fi
+  if ! command -v btrfs-snap >/dev/null 2>&1; then
+    log "btrfs-snap not found; skipping pre-update snapshot."
+    return 0
+  fi
+  local name="${SNAPSHOT_NAME_PREFIX}-${TS}"
+  log "Taking pre-update snapshot: $name"
+  if btrfs-snap create "$name" >/dev/null 2>&1; then
+    log "Snapshot created: $name"
+  else
+    log "WARN: snapshot creation failed; continuing update."
+  fi
+}
+
+dnf_update() {
+  hr; log "DNF: system update (excluding VFIO-critical components)"; hr
+
+  # Build exclude args
+  local exargs=()
+  for pat in $DNF_EXCLUDES; do
+    exargs+=( "--exclude=${pat}" )
+  done
+  log "Excluding: ${DNF_EXCLUDES}"
+
+  # Refresh metadata first (non-fatal)
+  dnf makecache -y || true
+
+  # Split flags safely
+  local oldIFS="$IFS"; IFS=$' \t\n'
+  # shellcheck disable=SC2206
+  local flags=( $DNF_FLAGS )
+  IFS="$oldIFS"
+
+  # First attempt
+  if ! dnf upgrade "${flags[@]}" "${exargs[@]}"; then
+    log "DNF upgrade failed with best solver; retrying with --no-best ..."
+    if ! dnf upgrade --no-best -y "${exargs[@]}"; then
+      log "DNF upgrade still failed; continuing to Flatpak/Snap."
+    fi
+  fi
+
+  # Optional: explicit security-only pass (still honoring excludes)
+  if [[ "${DNF_SECURITY_PASS:-1}" == "1" ]]; then
+    hr; log "DNF: security-only pass (honoring excludes)"; hr
+    dnf upgrade --security -y "${exargs[@]}" || log "Security pass had issues; continuing."
+  fi
+
+  # Safe cleanup
+  hr; log "DNF: autoremove orphaned dependencies (safe)"; hr
+  dnf autoremove -y || true
+}
+
+
+flatpak_update() {
+  if ! command -v flatpak >/dev/null 2>&1; then
+    log "Flatpak not installed; skipping."
+    return
+  fi
+  hr; log "Flatpak: update all apps and runtimes"; hr
+  flatpak update -y --noninteractive || log "Flatpak update had non-fatal issues; continuing."
+}
+
+snap_update() {
+  if ! command -v snap >/dev/null 2>&1; then
+    log "Snap not installed; skipping."
+    return
+  fi
+  hr; log "Snap: refresh installed snaps"; hr
+  # Ensure snapd is active (Fedora uses socket activation; enable both just in case)
+  systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+  systemctl enable --now snapd.service >/dev/null 2>&1 || true
+  # Give socket a breath
+  sleep 1
+  if ! snap refresh; then
+    log "Snap refresh failed or partial; check network/snapd. Continuing."
+  fi
+}
+
+main_run() {
+  need_root
+  {
+    hr
+    log "SAFE UPDATE START (log: $LOG_FILE)"
+    hr
+
+    take_btrfs_snapshot
+    dnf_update
+    flatpak_update
+    snap_update
+
+    hr
+    log "SAFE UPDATE COMPLETE"
+    hr
+  } 2>&1 | tee -a "$LOG_FILE"
+}
+
+case "${1:-}" in
+  "" )
+    main_run
+    ;;
+  log )
+    list_logs
+    ;;
+  follow )
+    follow_latest
+    ;;
+  * )
+    echo "Usage:"
+    echo "  sudo $0           # run safe update (DNF + Flatpak + Snap)"
+    echo "  sudo $0 log       # list recent logs"
+    echo "  sudo $0 follow    # tail the latest log"
+    exit 1
+    ;;
+esac
+

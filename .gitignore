@@ -1,0 +1,17 @@
+# Backup / temp / build artifacts
+*.swp
+*.tmp
+*.bak
+*.log
+
+# Package caches
+*.rpm
+*.deb
+
+# Editor files
+.vscode/
+.idea/
+
+# System junk
+.DS_Store
+Thumbs.db
