@@ -48,7 +48,7 @@ Typical items covered there include:
 
 > **Edit to your hardware first** (PCI IDs, BDFs). Then run each command consciously.
 
-Example: (these are representative examples; rely on your file for exact lines)
+Example: (these are representative examples; rely on pre_vfio_setup_cmds.sh file for exact lines)
 
 ```bash
 # Load VFIO modules at boot
